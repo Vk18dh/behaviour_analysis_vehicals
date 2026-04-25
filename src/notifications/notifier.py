@@ -1,0 +1,187 @@
+"""
+src/notifications/notifier.py
+Email (SMTP + TLS) and mock SMS notification system.
+Fires ONLY after a violation is approved via human review.
+"""
+
+from __future__ import annotations
+
+import smtplib
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Optional
+
+import requests
+
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class Notifier:
+    """
+    Sends email and SMS notifications about approved violations.
+
+    Config keys expected ('notifications' section):
+        email.smtp_host, email.smtp_port, email.sender, email.password,
+        email.receiver, email.use_tls
+        sms.mock, sms.provider_url, sms.api_key
+    """
+
+    def __init__(self, cfg: dict) -> None:
+        self._email_cfg = cfg.get("email", {})
+        self._sms_cfg   = cfg.get("sms",   {})
+
+    # ── Email ─────────────────────────────────────────────────────────
+
+    def send_email(self, violation) -> bool:
+        """
+        Send a violation notice email with the evidence image attached.
+
+        Args:
+            violation: SQLAlchemy Violation ORM object (or any object with
+                       .type, .plate_text, .speed_kmh, .fine_inr,
+                       .timestamp, .mv_act_section, .evidence_image attrs).
+
+        Returns:
+            True on success, False on failure.
+        """
+        cfg      = self._email_cfg
+        sender   = cfg.get("sender", "")
+        receiver = cfg.get("receiver", "")
+        password = cfg.get("password", "")
+        host     = cfg.get("smtp_host", "smtp.gmail.com")
+        port     = int(cfg.get("smtp_port", 587))
+        use_tls  = cfg.get("use_tls", True)
+
+        if not all([sender, receiver, password, host]):
+            logger.warning("Email config incomplete — skipping email notification.")
+            return False
+
+        try:
+            # Build MIME email
+            msg = MIMEMultipart()
+            msg["Subject"] = (
+                f"Traffic Violation Notice — "
+                f"{getattr(violation, 'plate_text', 'UNKNOWN')} — "
+                f"{getattr(violation, 'type', 'UNKNOWN')}"
+            )
+            msg["From"]    = sender
+            msg["To"]      = receiver
+
+            # Body
+            body = self._build_email_body(violation)
+            msg.attach(MIMEText(body, "html"))
+
+            # Attach evidence image (if exists)
+            img_path = getattr(violation, "evidence_image", None)
+            if img_path and Path(img_path).exists():
+                with open(img_path, "rb") as f:
+                    img_data = f.read()
+                img_part = MIMEImage(img_data, name=Path(img_path).name)
+                img_part.add_header(
+                    "Content-Disposition", "attachment",
+                    filename=Path(img_path).name,
+                )
+                msg.attach(img_part)
+
+            # Send
+            with smtplib.SMTP(host, port) as smtp:
+                if use_tls:
+                    smtp.starttls()
+                smtp.login(sender, password)
+                smtp.sendmail(sender, receiver, msg.as_string())
+
+            logger.info(
+                f"Email sent: violation #{getattr(violation, 'id', '?')} "
+                f"to {receiver}"
+            )
+            return True
+
+        except smtplib.SMTPAuthenticationError:
+            logger.error("Email auth failed — check sender/password in config.")
+            return False
+        except Exception as e:
+            logger.error(f"Email send failed: {e}")
+            return False
+
+    def _build_email_body(self, violation) -> str:
+        """Build an HTML email body for the violation notice."""
+        vtype  = getattr(violation, "type", "—")
+        plate  = getattr(violation, "plate_text", "—")
+        speed  = getattr(violation, "speed_kmh", "—")
+        fine   = getattr(violation, "fine_inr", "—")
+        ts     = getattr(violation, "timestamp", "—")
+        mv_act = getattr(violation, "mv_act_section", "—")
+        cam    = getattr(violation, "camera_id", "—")
+
+        return f"""
+        <html><body>
+        <h2 style="color:#c0392b;">Traffic Violation Notice</h2>
+        <table border="1" cellpadding="6" cellspacing="0">
+          <tr><td><b>Plate Number</b></td><td>{plate}</td></tr>
+          <tr><td><b>Violation Type</b></td><td>{vtype}</td></tr>
+          <tr><td><b>Speed Recorded</b></td><td>{speed} km/h</td></tr>
+          <tr><td><b>Fine Amount</b></td><td>INR {fine}</td></tr>
+          <tr><td><b>Date &amp; Time</b></td><td>{ts}</td></tr>
+          <tr><td><b>Camera</b></td><td>{cam}</td></tr>
+          <tr><td><b>MV Act Section</b></td><td>{mv_act}</td></tr>
+        </table>
+        <p>Please pay the fine within 60 days. Evidence image is attached.</p>
+        <p style="font-size:0.8em;color:#666;">
+          This notice is generated by the Smart Traffic Enforcement System.
+        </p>
+        </body></html>
+        """
+
+    # ── SMS ───────────────────────────────────────────────────────────
+
+    def send_sms(self, violation) -> bool:
+        """
+        Send SMS notification.
+        If sms.mock = true (default), just logs the payload — no real request.
+
+        Args:
+            violation: Violation ORM object.
+
+        Returns:
+            True on success / mock.
+        """
+        cfg    = self._sms_cfg
+        mock   = cfg.get("mock", True)
+        plate  = getattr(violation, "plate_text", "UNKNOWN")
+        vtype  = getattr(violation, "type", "UNKNOWN")
+        fine   = getattr(violation, "fine_inr", 0)
+
+        payload = {
+            "to":      f"owner_of_{plate}",   # replace with real lookup in production
+            "message": (
+                f"Traffic Violation Notice: Your vehicle {plate} was "
+                f"caught for {vtype}. Fine: INR {fine:.0f}. "
+                f"Pay within 60 days."
+            ),
+            "api_key": cfg.get("api_key", "MOCK"),
+        }
+
+        if mock:
+            logger.info(f"[MOCK SMS] {payload['message']}")
+            return True
+
+        # Real SMS via HTTP POST
+        try:
+            resp = requests.post(
+                cfg.get("provider_url", ""),
+                json=payload,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                logger.info(f"SMS sent for {plate} (violation {vtype})")
+                return True
+            else:
+                logger.warning(f"SMS failed: HTTP {resp.status_code} — {resp.text}")
+                return False
+        except Exception as e:
+            logger.error(f"SMS send error: {e}")
+            return False

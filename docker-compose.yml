@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: traffic_api
+    command: python main.py api --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./evidence:/app/evidence
+      - ./logs:/app/logs
+      - ./traffic.db:/app/traffic.db
+    environment:
+      - DATABASE_URL=sqlite:////app/traffic.db
+      - JWT_SECRET=CHANGEME_production_secret
+      - ADMIN_USER=admin
+      - ADMIN_PASS=admin123
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    container_name: traffic_dashboard
+    command: >
+      python -m streamlit run src/dashboard/dashboard.py
+      --server.headless true
+      --server.port 8501
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE_URL=http://api:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  evidence:
+  logs:

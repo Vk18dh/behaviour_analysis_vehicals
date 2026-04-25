@@ -1,0 +1,253 @@
+# ============================================================
+#  Vision-Based Traffic Enforcement System — Master Config
+#  Every hardcoded number lives here. No values in source code.
+# ============================================================
+
+system:
+  name: "Smart Traffic Enforcement System"
+  version: "1.0.0"
+  debug: false
+  log_level: "INFO"          # DEBUG | INFO | WARNING | ERROR
+  log_dir: "logs"
+  evidence_dir: "evidence"
+  db_url: "sqlite:///traffic.db"   # override with DATABASE_URL env var for PostgreSQL
+  secret_key: "CHANGE_ME_IN_PRODUCTION_32CHARS!!"   # AES-256 key (must be 32 bytes)
+
+# ---------- Camera / Input ----------
+camera:
+  default_fps: 25
+  target_fps: 15              # processing target (frames per second)
+  process_every_n_frames: 3   # process 1 in every N frames to speed up pipeline
+  buffer_size: 128            # ring buffer size in frames
+  max_retry: 5                # stream reconnect attempts
+  retry_delay_sec: 2.0
+  rtsp_streams:
+    - id: "cam_01"
+      url: "rtsp://0.0.0.0:8554/cam1"
+      location: "Highway NH-48 Gate 1"
+      gps_lat: 28.6139
+      gps_lon: 77.2090
+      road_direction: [0, -1]   # unit vector: [x, y] — downward in frame = forward
+      zone_type: "highway"      # highway | intersection | urban
+    - id: "cam_02"
+      url: "rtsp://0.0.0.0:8554/cam2"
+      location: "Highway NH-48 Gate 2"
+      gps_lat: 28.6200
+      gps_lon: 77.2100
+      road_direction: [0, -1]
+      zone_type: "highway"
+  webcam_index: 0
+
+# ---------- DIP Preprocessing ----------
+preprocessing:
+  white_balance: true
+  defog: false                # Dark Channel Prior defogging (slower)
+  gaussian_blur_kernel: 5     # must be odd
+  median_blur_kernel: 3       # must be odd
+  clahe_clip_limit: 2.0
+  clahe_tile_grid: [8, 8]
+  gamma: 1.2                  # >1 brightens dark frames; <1 darkens
+  stabilize: false            # feature-point homography stabilization
+  dark_frame_threshold: 80    # mean brightness (0-255) below which LLIE triggers
+
+# ---------- Low-Light Image Enhancement ----------
+llie:
+  enabled: true
+  use_deep_model: false       # false = classical CLAHE+gamma fallback
+  deep_model_path: "models/llie_model.pt"  # swap in DRM/KinD weights here
+
+# ---------- Lane Detection ----------
+lane:
+  canny_low: 50
+  canny_high: 150
+  hough_rho: 1
+  hough_theta_deg: 1.0
+  hough_threshold: 50
+  hough_min_line_len: 40
+  hough_max_line_gap: 150
+  roi_top_fraction: 0.55      # ROI mask: keep bottom X% of frame
+  # Homography calibration points (src=camera pixels, dst=bird's-eye pixels)
+  src_points: [[100, 720], [540, 450], [740, 450], [1180, 720]]
+  dst_points: [[200, 720], [200, 0],   [1000, 0],  [1000, 720]]
+  pixels_per_meter: 12.0      # calibration: pixels in bird's-eye per real meter
+
+# ---------- Vehicle Detection ----------
+detection:
+  model_path: "yolov8n.pt"    # auto-downloaded from ultralytics on first run
+  plate_model_path: "yolov8n.pt"   # ideally a fine-tuned plate detector
+  confidence_threshold: 0.40
+  iou_threshold: 0.45
+  device: "cpu"               # "cpu" | "0" | "cuda:0"
+  # COCO class IDs we care about (+ custom 80=auto_rickshaw if fine-tuned)
+  vehicle_classes:
+    bicycle: 1
+    car: 2
+    motorcycle: 3
+    bus: 5
+    truck: 7
+  # Logical groupings for rule engine
+  two_wheeler_ids: [1, 3]
+  three_wheeler_ids: [80]     # custom fine-tuned class; set [] if not available
+  heavy_vehicle_ids: [5, 7]
+  person_class_id: 0
+
+# ---------- Tracking ----------
+tracking:
+  max_age: 30                 # frames before lost track is removed
+  min_hits: 3                 # frames before track is confirmed
+  iou_threshold: 0.3
+  trajectory_history: 90      # max centroids stored per track (frames)
+
+# ---------- Feature Extraction ----------
+features:
+  speed_smoothing_window: 5   # moving-average window (frames)
+  accel_smoothing_window: 3
+  min_speed_for_tailgate: 5.0 # km/h — below this, skip tailgate check
+  use_optical_flow_fallback: true  # fallback if homography not set
+
+# ---------- Behavior Thresholds ----------
+behavior:
+  zigzag:
+    time_window_sec: 5.0
+    min_direction_changes: 2
+    lateral_displacement_m: 4.0    # total lateral shift in window
+    noise_filter_m: 1.0            # |Δx| must exceed this to count
+    lateral_accel_threshold: 2.5   # m/s² — at least once in window
+    sustained_sec: 2.0             # must weave for at least this long
+
+  tailgating:
+    time_headway_sec: 1.5          # flag if headway < this
+    sustained_duration_sec: 2.0    # must be sustained for this long
+
+  red_light:
+    roi_polygon: [[400, 500], [880, 500], [880, 600], [400, 600]]
+    signal_state: "RED"            # default; can be overridden via /signal API
+    min_speed_kmh: 2.0             # ignore stationary vehicles
+
+  overspeed:
+    speed_limit_kmh: 60.0
+    sustained_duration_sec: 3.0
+    # Dynamic fine: INR 1000 + 100 * floor((speed-limit)/5)
+    base_fine: 1000
+    per_5kmh: 100
+
+  wrong_direction:
+    dot_product_threshold: -0.5    # negative = opposing road vector
+    sustained_sec: 1.5
+
+  highway_restriction:
+    enabled: true                  # Set to false to disable restricted vehicle detection
+    # polygon covers the entire restricted highway zone in pixel coords
+    zone_polygon: [[0, 0], [1280, 0], [1280, 720], [0, 720]]
+
+  lane_violation:
+    fast_lane_x_fraction: 0.6     # rightmost lane starts at this x fraction of frame
+    sustained_sec: 3.0
+
+  rash_driving:
+    accel_threshold: 4.0           # m/s²
+    direction_change_rate: 1.5     # changes/sec
+
+  helmet:
+    confidence_threshold: 0.90
+    sustained_sec: 1.0
+
+  seatbelt:
+    confidence_threshold: 0.85
+
+  triple_riding:
+    min_persons: 3                 # persons inside 2W bbox
+
+  illegal_turn:
+    junction_roi: [[300, 400], [900, 400], [900, 720], [300, 720]]
+    angle_threshold_deg: 135
+    time_window_sec: 2.0
+
+  phone_use:
+    enabled: false                 # optional feature flag
+    confidence_threshold: 0.80
+
+# ---------- Rule Engine ----------
+rules:
+  initial_score: 100
+  deductions:
+    ZIGZAG: 5
+    TAILGATING: 3
+    RED_LIGHT: 10
+    OVERSPEED: 1                   # per 5 km/h over (multiplied dynamically)
+    WRONG_DIRECTION: 10
+    HIGHWAY_RESTRICTION: 6
+    LANE_VIOLATION: 5
+    RASH_DRIVING: 7
+    NO_HELMET: 2
+    NO_SEATBELT: 2
+    TRIPLE_RIDING: 6
+    ILLEGAL_TURN: 4
+    PHONE_USE: 3
+  fines_inr:
+    ZIGZAG: 1000
+    TAILGATING: 500
+    RED_LIGHT: 2000
+    OVERSPEED: 1000               # base; dynamic addition computed in rule engine
+    WRONG_DIRECTION: 2000
+    HIGHWAY_RESTRICTION: 1000
+    LANE_VIOLATION: 1000
+    RASH_DRIVING: 1000
+    NO_HELMET: 500
+    NO_SEATBELT: 1000
+    TRIPLE_RIDING: 600
+    ILLEGAL_TURN: 500
+    PHONE_USE: 1000
+  mv_act_sections:
+    ZIGZAG: "Section 183 – Dangerous Driving"
+    TAILGATING: "Section 183 – Reckless Driving"
+    RED_LIGHT: "Section 119 – Traffic Signal Violation"
+    OVERSPEED: "Section 183 – Exceeding Speed Limit"
+    WRONG_DIRECTION: "Section 183 – Wrong Side Driving"
+    HIGHWAY_RESTRICTION: "Section 115 – Prohibited Vehicle on Highway"
+    LANE_VIOLATION: "Section 183 – Lane Discipline"
+    RASH_DRIVING: "Section 184 – Rash Driving"
+    NO_HELMET: "Section 129 – Helmet Compulsory"
+    NO_SEATBELT: "Section 138(3) – Seatbelt Compulsory"
+    TRIPLE_RIDING: "Section 128 – Pillion Restrictions"
+    ILLEGAL_TURN: "Section 122 – Prohibited Turn"
+    PHONE_USE: "Section 184 – Use of Handheld Device"
+  categories:
+    safe:     [80, 100]
+    moderate: [50, 79]
+    risky:    [0, 49]
+
+# ---------- ANPR ----------
+anpr:
+  model_path: "yolov8n.pt"
+  ocr_languages: ["en"]
+  auto_accept_confidence: 0.90    # >= this → auto ticket
+  manual_review_confidence: 0.50  # >= this AND < auto → flag for review
+  # below manual_review_confidence → discard
+
+# ---------- Security / Auth ----------
+security:
+  jwt_secret: "CHANGE_ME_JWT_SECRET_KEY"
+  jwt_algorithm: "HS256"
+  token_expire_minutes: 60
+  roles:                          # role: list of allowed actions
+    admin: ["all"]
+    officer: ["upload", "start_live", "stop_live"]
+    reviewer: ["view", "review"]
+    readonly: ["view"]
+  default_admin_user: "admin"
+  default_admin_password: "admin123"  # CHANGE IN PRODUCTION
+
+# ---------- Notifications ----------
+notifications:
+  email:
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    sender: "traffic_system@example.com"
+    password: "CHANGE_ME"
+    receiver: "admin@example.com"
+    use_tls: true
+  sms:
+    mock: true
+    provider_url: "https://mock-sms.example.com/send"
+    api_key: "MOCK_KEY"
