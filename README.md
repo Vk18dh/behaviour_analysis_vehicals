@@ -82,12 +82,24 @@ behaviorpbl/
 
 ---
 
+## 🛠️ Recent Hardening & Optimization
+We recently implemented several critical updates to ensure production-grade reliability:
+- **Aspect-Ratio Invariance:** Seamlessly supports both **Landscape** and **Portrait** (vertical) video feeds through dynamic homography scaling.
+- **Timing Synchronization:** All behavior detectors now use **Video Timestamps** instead of system wall-clock time, eliminating "random" false positives during high CPU load.
+- **Administrative Control:** Added a "Danger Zone" in the dashboard for irreversible database purging and violation clearing.
+- **Security Hardening:** Updated default encryption keys and administrative passwords to resolve critical startup warnings.
+- **Refined Detectors:** Enhanced Wrong Direction and Lane Violation logic for better accuracy on complex road layouts.
+
+---
+
 ## ⚙️ Performance & Optimization
 - **Frame Skipping:** Configurable `process_every_n_frames` (in `settings.yaml`) to optimize throughput for high-resolution streams.
-- **Dynamic Toggles:** Enable/Disable specific behavior detectors (like Highway Restriction) directly from the **Web Dashboard** or configuration file.
+- **Dynamic Toggles:** Enable/Disable specific behavior detectors directly from the configuration file.
+- **Longest-Edge Resizing:** Optimized batch processing to resize based on the longest dimension, preventing memory overflows for vertical videos.
 - **Async I/O:** Multi-threaded frame buffering to prevent stale frames and minimize latency.
 
 ---
+
 
 ## 📜 License & Usage
 This project is intended for educational and research purposes. All MV Act fine values are aligned with the official Indian Motor Vehicles Act 2019 schedules.
