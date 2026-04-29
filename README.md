@@ -40,27 +40,100 @@ Detects a wide range of violations based on trajectory analysis and visual cues:
 
 ## 🚀 Quick Start
 
-### 1. Installation
+### Prerequisites
+- **Python 3.10+** installed ([download](https://www.python.org/downloads/))
+- A **webcam** (for real-time mode) or an **MP4/AVI video file** (for batch mode)
+- **~2 GB disk space** (for YOLO model weights and dependencies)
+
+### 1. Clone & Install
 ```bash
 git clone https://github.com/Vk18dh/behaviour_analysis_vehicals.git
 cd behaviour_analysis_vehicals
+
+# (Recommended) Create a virtual environment
+python -m venv .venv
+
+# Activate it
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# Windows CMD:
+.\.venv\Scripts\activate.bat
+# Linux / macOS:
+source .venv/bin/activate
+
+# Install all dependencies
 pip install -r requirements.txt
 ```
 
+> **Note:** On first run, YOLOv8 will automatically download the `yolov8n.pt` model weights (~6.5 MB). An internet connection is required for this one-time download.
+
 ### 2. Configuration
-The system is entirely **config-driven**. Adjust thresholds, fines, and camera parameters in `config/settings.yaml`.
+The system is entirely **config-driven**. All thresholds, fines, camera settings, and detection parameters live in `config/settings.yaml`.
 
 ```bash
-copy .env.example .env  # Update secrets like JWT_SECRET
+# (Optional) Copy the environment template and set your secrets
+copy .env.example .env
 ```
 
-### 3. Execution
-Run all services (API, Dashboard, and Pipeline) simultaneously:
+Key settings you may want to adjust in `config/settings.yaml`:
+| Setting | Location | Default | Purpose |
+|---------|----------|---------|---------|
+| `camera.process_every_n_frames` | Line 29 | `3` | Frame skip for real-time (higher = faster, less accurate) |
+| `camera.batch_process_every_n_frames` | Line 33 | `5` | Frame skip for uploaded videos |
+| `behavior.wrong_direction.road_dir` | Line 177 | `[0.0, -1.0]` | Traffic direction vector (`[0,-1]`=up, `[0,1]`=down, `[1,0]`=right) |
+| `preprocessing.defog` | Line 65 | `false` | Enable Dark Channel Prior defogging (heavy, only for hazy conditions) |
+
+### 3. How to Run
+
+#### Option A: Run Everything Together (Recommended)
+Starts the **API server**, **Streamlit dashboard**, and **live webcam pipeline** simultaneously:
 ```bash
 python main.py all --webcam 0
 ```
-- **API:** `http://localhost:8000/docs`
-- **Dashboard:** `http://localhost:8501` (Default login: `admin` / `admin123`)
+This launches three services:
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| **FastAPI Backend** | http://localhost:8000/docs | REST API with Swagger docs |
+| **Streamlit Dashboard** | http://localhost:8501 | Human review UI |
+| **Live Pipeline** | *(runs in terminal)* | Real-time detection from webcam |
+
+#### Option B: Run Individual Services
+```bash
+# Real-time pipeline only (webcam)
+python main.py live --webcam 0
+
+# Real-time pipeline only (RTSP camera)
+python main.py live --camera_id cam_01 --rtsp rtsp://192.168.1.100/stream
+
+# Batch process a video file
+python main.py batch --video path/to/video.mp4
+
+# API server only
+python main.py api --host 0.0.0.0 --port 8000
+
+# Dashboard only
+python main.py dash
+
+# Clear all violations from database
+python main.py clear          # violations + logs only
+python main.py clear --full   # also removes vehicles and credit scores
+```
+
+### 4. Login Credentials
+| Username | Password | Role |
+|----------|----------|------|
+| `admin` | `Admin@PBL2026` | Full admin access |
+
+### 5. Uploading a Video for Analysis
+1. Open the dashboard at **http://localhost:8501**
+2. Log in with the credentials above
+3. Navigate to the **"Upload Video"** section
+4. Select an MP4 or AVI file and click **Upload**
+5. The system will process the video in the background and violations will appear in the **"Human Review Queue"**
+
+### 6. Stopping the System
+Press **`Ctrl + C`** in the terminal where `main.py` is running. All services will shut down gracefully.
 
 ---
 
