@@ -65,6 +65,42 @@ def run_batch(args: argparse.Namespace) -> None:
         print(f"  {k:<22}: {v}")
 
 
+def run_clear(args: argparse.Namespace) -> None:
+    """Clear all violations from the database."""
+    from src.database.db import init_db, get_session
+    from src.database.models import Violation, BlockchainLog, AuditLog, CreditScore, Vehicle
+    
+    cfg = load_config()
+    db_url = cfg.get("system", {}).get("db_url", "sqlite:///traffic.db")
+    init_db(db_url)
+    
+    try:
+        with get_session() as db:
+            count = db.query(Violation).count()
+            if count == 0:
+                print("Database is already empty. No violations to clear.")
+                return
+                
+            confirm = input(f"Are you sure you want to delete {count} violations and related logs? (y/N): ")
+            if confirm.lower() != 'y':
+                print("Aborted.")
+                return
+                
+            db.query(BlockchainLog).delete()
+            db.query(AuditLog).delete()
+            db.query(Violation).delete()
+            # Optionally clear vehicles and scores to fully reset
+            if getattr(args, "full", False):
+                db.query(CreditScore).delete()
+                db.query(Vehicle).delete()
+                print("Cleared all Vehicles and Credit Scores as well.")
+                
+            print(f"Successfully cleared {count} violations and associated logs.")
+    except Exception as e:
+        logger.error(f"Failed to clear database: {e}")
+        sys.exit(1)
+
+
 def run_api(args: argparse.Namespace) -> None:
     """Start FastAPI backend via uvicorn."""
     import uvicorn
@@ -158,6 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── dash ──────────────────────────────────────────────────────────
     sub.add_parser("dash", help="Launch the Streamlit dashboard.")
+    
+    # ── clear ─────────────────────────────────────────────────────────
+    p_clear = sub.add_parser("clear", help="Empty the database violations.")
+    p_clear.add_argument("--full", action="store_true", help="Also delete vehicles and credit scores.")
 
     # ── all ───────────────────────────────────────────────────────────
     p_all = sub.add_parser(
@@ -191,6 +231,8 @@ def main() -> None:
         run_api(args)
     elif args.command == "dash":
         run_dashboard()
+    elif args.command == "clear":
+        run_clear(args)
     elif args.command == "all":
         run_all(args)
     else:

@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import cv2
 import uvicorn
 from fastapi import (
     BackgroundTasks, Depends, FastAPI, File, HTTPException,
@@ -356,6 +357,31 @@ async def list_violations(
         ]
 
 
+@app.delete("/violations", tags=["Data"])
+async def clear_all_violations(
+    current: TokenData = Depends(_require_role("admin")),
+):
+    """Clear all violations and associated logs from the database. Requires admin role."""
+    from src.database.models import BlockchainLog, AuditLog
+    with get_session() as db:
+        try:
+            count = db.query(Violation).count()
+            if count == 0:
+                return {"status": "ok", "message": "Database is already empty", "deleted_count": 0}
+                
+            db.query(BlockchainLog).delete()
+            db.query(AuditLog).delete()
+            db.query(Violation).delete()
+            db.commit()
+            
+            log_audit("CLEAR_VIOLATIONS", actor=current.username, new_value={"deleted_count": count})
+            return {"status": "ok", "message": f"Successfully cleared {count} violations", "deleted_count": count}
+        except Exception as e:
+            logger.error(f"Failed to clear violations: {e}")
+            db.rollback()
+            raise HTTPException(500, "Failed to clear database.")
+
+
 # ── Vehicle Detail ────────────────────────────────────────────────────
 
 @app.get("/vehicle/{vehicle_id}", tags=["Data"])
@@ -449,6 +475,16 @@ def _send_notification_bg(violation_id: int, actor: str) -> None:
         logger.error(f"Notification error for violation #{violation_id}: {e}")
 # ── Configuration ─────────────────────────────────────────────────────
 
+@app.get("/config/highway_restriction", tags=["Config"])
+async def get_highway_restriction(
+    current: TokenData = Depends(_require_role("view")),
+):
+    """Get the current state of the highway restriction toggle."""
+    from src.utils.helpers import load_config
+    cfg = load_config()
+    enabled = cfg.get("behavior", {}).get("highway_restriction", {}).get("enabled", False)
+    return {"status": "success", "highway_restriction_enabled": enabled}
+
 @app.patch("/config/highway_restriction", tags=["Config"])
 async def update_highway_restriction(
     req: HighwayRestrictionConfig,
@@ -484,6 +520,123 @@ async def update_highway_restriction(
             
     log_audit("CONFIG_UPDATE", actor=current.username, new_value={"highway_restriction_enabled": req.enabled})
     return {"status": "success", "highway_restriction_enabled": req.enabled}
+
+
+# ── DIP Stats ────────────────────────────────────────────────────────
+
+@app.get("/dip/stats", tags=["DIP"])
+async def get_dip_stats(
+    n: int = Query(100, le=500, description="Number of recent reports to return"),
+    current: TokenData = Depends(_require_role("view")),
+):
+    """
+    Return the last N DIP processing reports from the active pipeline.
+    Each report shows: frame_idx, problems_detected, fixes_applied,
+    brightness/contrast/blur before+after, noise_level, timestamp.
+    """
+    from src.preprocessing.dip import get_active_dip_instance
+    dip = get_active_dip_instance()
+    if dip is None:
+        return {"reports": [], "total_buffered": 0, "status": "no_active_pipeline"}
+
+    reports = list(dip.recent_reports)[-n:]
+    return {
+        "reports": [r.to_dict() for r in reports],
+        "total_buffered": len(dip.recent_reports),
+        "status": "ok",
+    }
+
+
+@app.post("/dip/analyze_video", tags=["DIP"])
+async def analyze_video_dip(
+    file: UploadFile = File(...),
+    max_frames: int = Query(30, le=500, description="Max frames to sample (30 = ~2-3s for any length video)"),
+    current: TokenData = Depends(_require_role("upload")),
+):
+    """
+    Run DIP analysis ONLY on an uploaded video (no full detection pipeline).
+    Returns per-frame DIPReports for the dashboard DIP Monitor tab.
+    Samples up to max_frames evenly across the video.
+    """
+    import tempfile, shutil
+    from src.preprocessing.dip import DIPPreprocessor
+    from src.utils.helpers import load_config
+
+    allowed = {".mp4", ".avi", ".mov"}
+    suffix  = Path(file.filename).suffix.lower()
+    if suffix not in allowed:
+        raise HTTPException(400, f"Unsupported type '{suffix}'.")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+    finally:
+        tmp.close()
+
+    try:
+        cfg = load_config()
+        dip = DIPPreprocessor(cfg.get("preprocessing", {}), report_buffer_size=1000)
+
+        cap = cv2.VideoCapture(tmp_path)
+
+        # ── Robust frame count ────────────────────────────────────────
+        # CAP_PROP_FRAME_COUNT returns 0 for many MP4/H264 files.
+        # Fast pre-scan: just read() without decoding colour (grab only).
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 1:
+            total = 0
+            while cap.grab():   # grab() is much faster than read() — no decode
+                total += 1
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # rewind to start
+
+        step      = max(1, total // max(max_frames, 1))
+        reports   = []
+        frame_idx = 0
+
+        # Analysis resize: tiny frame = very fast DIP metrics (no detection needed)
+        _ANA_W, _ANA_H = 320, 240
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % step == 0 and len(reports) < max_frames:
+                # Downscale — we only need quality metrics, not detection
+                small = cv2.resize(frame, (_ANA_W, _ANA_H), interpolation=cv2.INTER_LINEAR)
+                _, report = dip.preprocess(small, frame_idx=frame_idx)
+                reports.append(report.to_dict())
+            frame_idx += 1
+
+        cap.release()
+        total = total or frame_idx   # use actual count if pre-scan was skipped
+
+        # Summary stats
+        all_problems = [p for r in reports for p in r["problems_detected"]]
+        problem_counts = {}
+        for p in set(all_problems):
+            problem_counts[p] = all_problems.count(p)
+
+        all_fixes = [f for r in reports for f in r["fixes_applied"]]
+        fix_counts = {}
+        for f in set(all_fixes):
+            fix_counts[f] = all_fixes.count(f)
+
+        return {
+            "total_frames_sampled": len(reports),
+            "total_frames_in_video": total,
+            "problem_counts": problem_counts,
+            "fix_counts": fix_counts,
+            "reports": reports,
+        }
+    except Exception as e:
+        logger.error(f"DIP video analysis error: {e}")
+        raise HTTPException(500, f"Analysis failed: {e}")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════

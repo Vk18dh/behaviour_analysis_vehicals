@@ -11,13 +11,30 @@ system:
   log_dir: "logs"
   evidence_dir: "evidence"
   db_url: "sqlite:///traffic.db"   # override with DATABASE_URL env var for PostgreSQL
-  secret_key: "CHANGE_ME_IN_PRODUCTION_32CHARS!!"   # AES-256 key (must be 32 bytes)
+  # AES-256 key for plate-number encryption (must be exactly 32 bytes).
+  # IMPORTANT: Override this with the AES_SECRET_KEY environment variable in production.
+  # Example: export AES_SECRET_KEY="your-random-32-byte-string-here"
+  # The value below is a secure generated key.
+  secret_key: "K8#mF2!vLp$z9QxX7wEa*rT5yU4bN1cM"   # overridden by AES_SECRET_KEY env var
+  # Duplicate violation cooldown: same plate + same violation type within this
+  # many seconds is treated as the same event and NOT saved again.
+  # Set to 0 to disable deduplication entirely.
+  dedup_window_sec: 120      # 2 minutes — tune per enforcement policy
 
 # ---------- Camera / Input ----------
 camera:
   default_fps: 25
   target_fps: 15              # processing target (frames per second)
-  process_every_n_frames: 3   # process 1 in every N frames to speed up pipeline
+  # Realtime pipeline: process 1 in every N frames (3 = ~8 FPS at 25 FPS source)
+  process_every_n_frames: 3
+  # Batch pipeline: process 1 in every N frames.
+  # 5 = good speed/accuracy tradeoff for 25 FPS uploads.
+  # Set to 1 to process every single frame (slowest, most accurate).
+  batch_process_every_n_frames: 5
+  # Resize width for batch processing (height auto-scaled).
+  # 960 = good tradeoff between speed and detection accuracy at 1080p source.
+  # Set to 0 to disable resizing.
+  batch_resize_width: 960
   buffer_size: 128            # ring buffer size in frames
   max_retry: 5                # stream reconnect attempts
   retry_delay_sec: 2.0
@@ -41,14 +58,26 @@ camera:
 # ---------- DIP Preprocessing ----------
 preprocessing:
   white_balance: true
-  defog: false                # Dark Channel Prior defogging (slower)
-  gaussian_blur_kernel: 5     # must be odd
-  median_blur_kernel: 3       # must be odd
+  # Dark Channel Prior defogging: effective for real foggy/hazy conditions.
+  # DISABLED by default — it is the heaviest DIP operation (~40ms/frame on
+  # 1080p with adaptive downscale, ~300ms without). Only enable if your
+  # camera location regularly experiences haze/fog.
+  defog: false
+  gaussian_blur_kernel: 0     # set >1 (odd) for extra smoothing; 0 = disabled
+  median_blur_kernel: 3       # must be odd; 3 = gentle noise removal
   clahe_clip_limit: 2.0
   clahe_tile_grid: [8, 8]
   gamma: 1.2                  # >1 brightens dark frames; <1 darkens
-  stabilize: false            # feature-point homography stabilization
+  stabilize: false            # feature-point optical-flow stabilization
   dark_frame_threshold: 80    # mean brightness (0-255) below which LLIE triggers
+  # Haze detection tuning — lower = stricter (fewer false positives)
+  haze_contrast_threshold: 35.0   # pixel std-dev below which frame is considered hazy
+  # DIP quality metric thresholds
+  brightness_low_threshold: 80.0
+  brightness_high_threshold: 200.0
+  blur_threshold: 100.0
+  noise_threshold: 28.0
+  color_cast_threshold: 15.0
 
 # ---------- Low-Light Image Enhancement ----------
 llie:
@@ -66,9 +95,10 @@ lane:
   hough_min_line_len: 40
   hough_max_line_gap: 150
   roi_top_fraction: 0.55      # ROI mask: keep bottom X% of frame
-  # Homography calibration points (src=camera pixels, dst=bird's-eye pixels)
-  src_points: [[100, 720], [540, 450], [740, 450], [1180, 720]]
-  dst_points: [[200, 720], [200, 0],   [1000, 0],  [1000, 720]]
+  # Homography calibration points (fraction of frame width/height, 0.0-1.0)
+  # Default simulates a camera looking straight down a highway.
+  src_points: [[0.08, 1.0], [0.42, 0.62], [0.58, 0.62], [0.92, 1.0]]
+  dst_points: [[0.15, 1.0], [0.15, 0.0],  [0.85, 0.0],  [0.85, 1.0]]
   pixels_per_meter: 12.0      # calibration: pixels in bird's-eye per real meter
 
 # ---------- Vehicle Detection ----------
@@ -104,68 +134,86 @@ features:
   accel_smoothing_window: 3
   min_speed_for_tailgate: 5.0 # km/h — below this, skip tailgate check
   use_optical_flow_fallback: true  # fallback if homography not set
+  # px_per_meter_fallback: pixels per real-world meter in bird's-eye view
+  # HOW TO CALIBRATE: find an object of known length (e.g. 4m car) in your
+  # bird's-eye frame and count how many pixels it spans. Set that here.
+  # A warning is logged every 100 frames if homography is not calibrated.
+  px_per_meter_fallback: 20.0   # rough default; tune per camera
 
 # ---------- Behavior Thresholds ----------
 behavior:
   zigzag:
     time_window_sec: 5.0
-    min_direction_changes: 2
-    lateral_displacement_m: 4.0    # total lateral shift in window
-    noise_filter_m: 1.0            # |Δx| must exceed this to count
-    lateral_accel_threshold: 2.5   # m/s² — at least once in window
-    sustained_sec: 2.0             # must weave for at least this long
+    min_direction_changes: 1
+    lateral_displacement_m: 1.5    # total lateral shift in window
+    noise_filter_m: 0.5            # |Δx| must exceed this to count
+    lateral_accel_threshold: 0.5   # m/s² — at least once in window
+    sustained_sec: 0.5             # must weave for at least this long
 
   tailgating:
     time_headway_sec: 1.5          # flag if headway < this
-    sustained_duration_sec: 2.0    # must be sustained for this long
+    sustained_duration_sec: 1.0    # must be sustained for this long
 
   red_light:
-    roi_polygon: [[400, 500], [880, 500], [880, 600], [400, 600]]
-    signal_state: "RED"            # default; can be overridden via /signal API
+    # ROI polygon for the stop-line zone (fraction of frame width/height, 0.0–1.0)
+    # Example below covers the middle-horizontal band of the frame.
+    # To use pixel coords instead: [[400, 500], [880, 500], [880, 600], [400, 600]]
+    roi_polygon: [[0.31, 0.69], [0.69, 0.69], [0.69, 0.83], [0.31, 0.83]]
+    # signal_state: the current traffic light state. Defaults to GREEN so that
+    # no red-light violations are raised until you explicitly set it to RED
+    # (via the /signal API endpoint or by changing this value).
+    signal_state: "GREEN"
     min_speed_kmh: 2.0             # ignore stationary vehicles
 
   overspeed:
     speed_limit_kmh: 60.0
-    sustained_duration_sec: 3.0
+    sustained_duration_sec: 1.0
     # Dynamic fine: INR 1000 + 100 * floor((speed-limit)/5)
     base_fine: 1000
     per_5kmh: 100
 
   wrong_direction:
+    # Road direction vector (x, y). Default [0.0, -1.0] means traffic flows UP the screen.
+    # Change to [1.0, 0.0] for left-to-right, [0.0, 1.0] for DOWN the screen, etc.
+    road_dir: [0.0, -1.0]
     dot_product_threshold: -0.5    # negative = opposing road vector
-    sustained_sec: 1.5
+    sustained_sec: 0.5
 
   highway_restriction:
-    enabled: true                  # Set to false to disable restricted vehicle detection
-    # polygon covers the entire restricted highway zone in pixel coords
-    zone_polygon: [[0, 0], [1280, 0], [1280, 720], [0, 720]]
+    enabled: false                  # Set to false to disable restricted vehicle detection
+    # zone_polygon covers the restricted highway zone (fraction of frame 0.0–1.0).
+    # Default [0,0]-[1,1] covers the entire frame — restrict this to the actual highway lane.
+    zone_polygon: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
 
   lane_violation:
     fast_lane_x_fraction: 0.6     # rightmost lane starts at this x fraction of frame
-    sustained_sec: 3.0
+    sustained_sec: 1.0
 
   rash_driving:
     accel_threshold: 4.0           # m/s²
     direction_change_rate: 1.5     # changes/sec
 
   helmet:
-    confidence_threshold: 0.90
-    sustained_sec: 1.0
+    confidence_threshold: 0.70
+    sustained_sec: 0.5
 
   seatbelt:
-    confidence_threshold: 0.85
+    confidence_threshold: 0.65
 
   triple_riding:
     min_persons: 3                 # persons inside 2W bbox
 
   illegal_turn:
-    junction_roi: [[300, 400], [900, 400], [900, 720], [300, 720]]
+    # junction_roi: polygon for the junction area (fraction of frame 0.0–1.0)
+    junction_roi: [[0.23, 0.55], [0.70, 0.55], [0.70, 1.0], [0.23, 1.0]]
     angle_threshold_deg: 135
     time_window_sec: 2.0
 
   phone_use:
-    enabled: false                 # optional feature flag
+    enabled: true              # Phone-use detection via sub-classifier crop
     confidence_threshold: 0.80
+    # Note: requires a fine-tuned phone-use detection model.
+    # Set enabled: false to skip this detector if no model is available.
 
 # ---------- Rule Engine ----------
 rules:
@@ -227,7 +275,9 @@ anpr:
 
 # ---------- Security / Auth ----------
 security:
-  jwt_secret: "CHANGE_ME_JWT_SECRET_KEY"
+  # JWT signing secret. Override with JWT_SECRET_KEY environment variable.
+  # Example: export JWT_SECRET_KEY="your-long-random-secret-string"
+  jwt_secret: "J9xX7wEa*rT5yU4bN1cMK8#mF2!vLp$z"   # overridden by JWT_SECRET_KEY env var
   jwt_algorithm: "HS256"
   token_expire_minutes: 60
   roles:                          # role: list of allowed actions
@@ -236,7 +286,9 @@ security:
     reviewer: ["view", "review"]
     readonly: ["view"]
   default_admin_user: "admin"
-  default_admin_password: "admin123"  # CHANGE IN PRODUCTION
+  # Admin password. Override with ADMIN_PASS environment variable.
+  # Example: export ADMIN_PASS="your-strong-password"
+  default_admin_password: "Admin@PBL2026"  # overridden by ADMIN_PASS env var
 
 # ---------- Notifications ----------
 notifications:

@@ -192,10 +192,8 @@ class LaneDetector:
         self.calibrator = HomographyCalibrator(
             pixels_per_meter=cfg.get("pixels_per_meter", 12.0)
         )
-        src = cfg.get("src_points")
-        dst = cfg.get("dst_points")
-        if src and dst:
-            self.calibrator.compute_homography(src, dst)
+        self._cfg_src = cfg.get("src_points")
+        self._cfg_dst = cfg.get("dst_points")
 
         logger.info("LaneDetector initialised.")
 
@@ -264,6 +262,16 @@ class LaneDetector:
             On failure, returns last known good result.
         """
         h, w = frame.shape[:2]
+
+        # Dynamically scale calibration points on first frame
+        if not self.calibrator.is_calibrated and self._cfg_src and self._cfg_dst:
+            scaled_src = []
+            for px, py in self._cfg_src:
+                scaled_src.append([int(px * w) if px <= 1.5 else px, int(py * h) if py <= 1.5 else py])
+            scaled_dst = []
+            for px, py in self._cfg_dst:
+                scaled_dst.append([int(px * w) if px <= 1.5 else px, int(py * h) if py <= 1.5 else py])
+            self.calibrator.compute_homography(scaled_src, scaled_dst)
 
         try:
             gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

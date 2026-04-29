@@ -106,21 +106,66 @@ class VehicleTracker:
         self,
         detections: List[Detection],
         frame_ts: float,
+        homography=None,
     ) -> List[Track]:
-        """Assign sequential IDs when ByteTrack is unavailable."""
+        """Assign sequential IDs when ByteTrack is unavailable (Simple IoU tracking)."""
         tracks = []
-        for det in detections:
+        if not hasattr(self, '_prev_tracks'):
+            self._prev_tracks = []
+            
+        unmatched_dets = list(range(len(detections)))
+        
+        for p_track in self._prev_tracks:
+            best_iou = 0.0
+            best_det_idx = -1
+            for idx in unmatched_dets:
+                iou = self._bbox_overlap(p_track.bbox, detections[idx].bbox)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det_idx = idx
+                    
+            if best_iou > self._iou_threshold and best_det_idx != -1:
+                det = detections[best_det_idx]
+                unmatched_dets.remove(best_det_idx)
+                
+                tid = p_track.id
+                self.pixel_history[tid].append(det.centroid)
+                if homography is not None and homography.is_calibrated:
+                    wx, wy = homography.pixel_to_world(det.centroid[0], det.centroid[1])
+                    self.world_history[tid].append((wx, wy))
+                self.ts_history[tid].append(frame_ts)
+                self.class_votes[tid][det.class_id] += 1
+                self._ages[tid] += 1
+                self._hits[tid] += 1
+                
+                tracks.append(Track(
+                    id=tid, bbox=det.bbox, class_id=det.class_id,
+                    class_name=det.class_name, centroid=det.centroid,
+                    confidence=det.confidence, age=self._ages[tid], hits=self._hits[tid],
+                    timestamp=frame_ts,
+                ))
+                
+        for idx in unmatched_dets:
+            det = detections[idx]
             tid = VehicleTracker._NEXT_ID
             VehicleTracker._NEXT_ID += 1
             self.pixel_history[tid].append(det.centroid)
+            if homography is not None and homography.is_calibrated:
+                wx, wy = homography.pixel_to_world(det.centroid[0], det.centroid[1])
+                self.world_history[tid].append((wx, wy))
             self.ts_history[tid].append(frame_ts)
             self.class_votes[tid][det.class_id] += 1
+            self._ages[tid] = 1
+            self._hits[tid] = 1
+            
             tracks.append(Track(
                 id=tid, bbox=det.bbox, class_id=det.class_id,
                 class_name=det.class_name, centroid=det.centroid,
                 confidence=det.confidence, age=1, hits=1,
                 timestamp=frame_ts,
             ))
+            
+        self._prev_tracks = tracks
         return tracks
 
     # ── Public API ────────────────────────────────────────────────────
@@ -148,7 +193,7 @@ class VehicleTracker:
             frame_ts = time.time()
 
         if self._tracker is None:
-            return self._fallback_update(detections, frame_ts)
+            return self._fallback_update(detections, frame_ts, homography)
 
         if not detections:
             # Still call tracker update to age out stale tracks
@@ -174,7 +219,7 @@ class VehicleTracker:
             )
         except Exception as e:
             logger.warning(f"ByteTrack update error: {e} — using fallback.")
-            return self._fallback_update(detections, frame_ts)
+            return self._fallback_update(detections, frame_ts, homography)
 
         tracks: List[Track] = []
 

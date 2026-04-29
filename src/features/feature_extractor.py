@@ -80,9 +80,13 @@ class FeatureExtractor:
         self._accel_win  = cfg.get("accel_smoothing_window", 3)
         self._min_speed  = cfg.get("min_speed_for_tailgate", 5.0)
         self._use_flow   = cfg.get("use_optical_flow_fallback", True)
+        # px_per_meter_fallback: used when homography is not calibrated.
+        # Tune this to match your camera: count pixels for a known real-world length.
+        self._px_per_m   = cfg.get("px_per_meter_fallback", 20.0)
         self._homography = homography
         self._fps        = fps
         self._dt         = 1.0 / fps
+        self._uncalib_warn_counter = 0   # throttle calibration warnings
 
         # Per-track rolling state
         self._world_prev:   Dict[int, Tuple[float, float]] = {}  # (wx, wy) previous
@@ -134,15 +138,36 @@ class FeatureExtractor:
             if world_history and tid in world_history and len(world_history[tid]) >= 2:
                 wh = list(world_history[tid])
                 th = list(ts_history[tid]) if ts_history else None
-                wx1, wy1 = wh[-2]
+                
+                # Real-world fix: Use a longer baseline (up to 15 frames / 1 sec)
+                # to eliminate bounding box jitter noise. Frame-to-frame jitter
+                # artificially inflates speed.
+                N = min(len(wh), 15)
+                wx_start, wy_start = wh[-N]
                 wx2, wy2 = wh[-1]
-                dt = (th[-1] - th[-2]) if (th and len(th) >= 2) else self._dt
+                
+                if th and len(th) >= N:
+                    dt = th[-1] - th[-N]
+                else:
+                    dt = self._dt * (N - 1)
                 dt = max(dt, 1e-3)
 
-                dist_m    = math.sqrt((wx2-wx1)**2 + (wy2-wy1)**2)
-                speed_mps = dist_m / dt
+                dist_m = math.sqrt((wx2 - wx_start)**2 + (wy2 - wy_start)**2)
+                
+                # Ignore sub-meter jitter if it's virtually stationary
+                if dist_m < 0.5:
+                    speed_mps = 0.0
+                else:
+                    speed_mps = dist_m / dt
+                    
                 speed_kmh = speed_mps * 3.6
-                lat_speed = abs(wx2 - wx1) / dt   # lateral world speed (m/s)
+                
+                # Frame-to-frame delta for lateral acceleration and direction
+                wx1, wy1 = wh[-2]
+                dt_frame = (th[-1] - th[-2]) if (th and len(th) >= 2) else self._dt
+                dt_frame = max(dt_frame, 1e-3)
+                
+                lat_speed = abs(wx2 - wx1) / dt_frame   # lateral world speed (m/s)
 
                 # Direction vector
                 f.direction_vec = vector_normalize((wx2 - wx1, wy2 - wy1))
@@ -155,6 +180,15 @@ class FeatureExtractor:
             elif self._use_flow and flow is not None:
                 # Fallback: optical flow inside bbox
                 speed_kmh = self._flow_speed(flow, track.bbox, frame.shape)
+                # Warn if homography is not calibrated
+                self._uncalib_warn_counter += 1
+                if self._uncalib_warn_counter % 100 == 1:
+                    if self._homography is None or not getattr(self._homography, 'is_calibrated', True):
+                        logger.warning(
+                            "[FeatureExtractor] Homography NOT calibrated — speed values "
+                            "are APPROXIMATE (optical flow fallback). "
+                            "Set src_points/dst_points in config/settings.yaml for accurate readings."
+                        )
 
             # ── Speed smoothing ───────────────────────────────────────
             self._speed_hist[tid].append(speed_kmh)
@@ -313,9 +347,10 @@ class FeatureExtractor:
         roi_flow = flow[y1:y2, x1:x2]
         mag = np.sqrt(roi_flow[:, :, 0]**2 + roi_flow[:, :, 1]**2)
         mean_px_per_frame = float(mag.mean())
-        # Rough conversion: pixels/frame → km/h using fixed scale
-        # (homography gives accurate values; this is approximation only)
-        speed_mps = mean_px_per_frame * self._fps / 50.0  # 50px ≈ 1 m (placeholder)
+        # Conversion: pixels/frame → m/s → km/h
+        # px_per_meter_fallback is configurable in settings.yaml (features section).
+        # Default 20.0 px/m is a rough estimate; calibrate per-camera for accuracy.
+        speed_mps = mean_px_per_frame * self._fps / max(self._px_per_m, 1.0)
         return speed_mps * 3.6
 
 

@@ -121,7 +121,11 @@ class BehaviorEngine:
         self._helmet_sus: Dict[int, _SustainedState] = defaultdict(_SustainedState)
 
         # Signal state — can be overridden via API
-        self.signal_state: str = cfg.get("red_light", {}).get("signal_state", "RED")
+        self.signal_state: str = cfg.get("red_light", {}).get("signal_state", "GREEN")
+
+        # Frame dimensions (set each call) — used for ROI fraction scaling
+        self._frame_w: int = 1280
+        self._frame_h: int = 720
 
         logger.info("BehaviorEngine initialised — all 13 detectors active.")
 
@@ -137,6 +141,7 @@ class BehaviorEngine:
         frame_idx: int = 0,
         frame: Optional[np.ndarray] = None,
         persons: Optional[List] = None,
+        frame_ts: Optional[float] = None,
     ) -> List[Violation]:
         """
         Run every behavior detector on the current frame.
@@ -153,7 +158,11 @@ class BehaviorEngine:
             List of Violation objects detected this frame.
         """
         violations: List[Violation] = []
-        now = time.time()
+        now = frame_ts if frame_ts is not None else time.time()
+
+        # Update frame dimensions for ROI fraction scaling
+        if frame is not None:
+            self._frame_h, self._frame_w = frame.shape[:2]
 
         for track in tracks:
             tid  = track.id
@@ -165,17 +174,17 @@ class BehaviorEngine:
             v = self._detect_zigzag(track, f, frame_idx, now)
             if v: violations.append(v)
 
-            # 2. Tailgating
-            v = self._detect_tailgating(track, f, frame_idx, now)
-            if v: violations.append(v)
+            # 2. Tailgating (Disabled per user request)
+            # v = self._detect_tailgating(track, f, frame_idx, now)
+            # if v: violations.append(v)
 
             # 3. Red-Light
             v = self._detect_red_light(track, f, frame_idx, now)
             if v: violations.append(v)
 
-            # 4. Overspeed
-            v = self._detect_overspeed(track, f, frame_idx, now)
-            if v: violations.append(v)
+            # 4. Overspeed (Disabled per user request)
+            # v = self._detect_overspeed(track, f, frame_idx, now)
+            # if v: violations.append(v)
 
             # 5. Wrong-Way
             v = self._detect_wrong_direction(track, f, frame_idx, now)
@@ -198,10 +207,10 @@ class BehaviorEngine:
                 v = self._detect_no_helmet(track, f, frame, frame_idx, now)
                 if v: violations.append(v)
 
-            # 10. Seatbelt
-            if frame is not None and self._detector is not None:
-                v = self._detect_no_seatbelt(track, f, frame, frame_idx, now)
-                if v: violations.append(v)
+            # 10. Seatbelt (Disabled per user request)
+            # if frame is not None and self._detector is not None:
+            #     v = self._detect_no_seatbelt(track, f, frame, frame_idx, now)
+            #     if v: violations.append(v)
 
             # 11. Triple Riding
             if persons is not None:
@@ -212,14 +221,52 @@ class BehaviorEngine:
             v = self._detect_illegal_turn(track, f, frame_idx, now)
             if v: violations.append(v)
 
-            # 13. Phone Use (feature-flagged)
-            if (self._cfg.get("phone_use", {}).get("enabled", False)
-                    and frame is not None
-                    and self._detector is not None):
-                v = self._detect_phone_use(track, f, frame, frame_idx, now)
-                if v: violations.append(v)
+            # 13. Phone Use (Disabled per user request)
+            # if (self._cfg.get("phone_use", {}).get("enabled", False)
+            #         and frame is not None
+            #         and self._detector is not None):
+            #     v = self._detect_phone_use(track, f, frame, frame_idx, now)
+            #     if v: violations.append(v)
 
         return violations
+
+    # ══════════════════════════════════════════════════════════════════
+    # ROI Scaling Helper
+    # ══════════════════════════════════════════════════════════════════
+
+    def _scale_roi(
+        self,
+        roi: List[List],
+    ) -> List[Tuple[int, int]]:
+        """
+        Convert an ROI polygon to absolute pixel coordinates.
+
+        Supports TWO formats:
+          - Pixel format:    [[400, 500], [880, 500], ...] (values > 1.5)
+          - Fraction format: [[0.31, 0.69], [0.69, 0.69], ...] (values 0.0–1.5)
+
+        Fraction format is camera-resolution-agnostic and preferred.
+        Pixel format is kept for backward compatibility.
+
+        Args:
+            roi: List of [x, y] pairs from config.
+
+        Returns:
+            List of (x_px, y_px) integer tuples.
+        """
+        if not roi:
+            return []
+        # Detect fraction vs pixel by checking if max value <= 1.5
+        flat_vals = [v for pt in roi for v in pt]
+        is_fraction = max(flat_vals) <= 1.5
+        result = []
+        for pt in roi:
+            x, y = pt[0], pt[1]
+            if is_fraction:
+                result.append((int(x * self._frame_w), int(y * self._frame_h)))
+            else:
+                result.append((int(x), int(y)))
+        return result
 
     # ══════════════════════════════════════════════════════════════════
     # Detector 1 — Zigzag / Weaving
@@ -369,7 +416,8 @@ class BehaviorEngine:
         Min speed filter to exclude naturally parked vehicles.
         """
         cfg      = self._cfg.get("red_light", {})
-        roi      = cfg.get("roi_polygon", [[400,500],[880,500],[880,600],[400,600]])
+        roi_raw  = cfg.get("roi_polygon", [[0.31, 0.69], [0.69, 0.69], [0.69, 0.83], [0.31, 0.83]])
+        roi      = self._scale_roi(roi_raw)
         min_spd  = cfg.get("min_speed_kmh", 2.0)
         state    = self._states["RED_LIGHT"][track.id]
 
@@ -453,8 +501,11 @@ class BehaviorEngine:
         cfg      = self._cfg.get("wrong_direction", {})
         dot_thr  = cfg.get("dot_product_threshold", -0.5)
         sustain  = cfg.get("sustained_sec", 1.5)
-        # Default road direction: forward = (0, -1) i.e. upward in frame
-        road_dir = (0.0, -1.0)
+        
+        # Read road direction from config, fallback to upward (0, -1)
+        rd_cfg   = cfg.get("road_dir", [0.0, -1.0])
+        road_dir = (float(rd_cfg[0]), float(rd_cfg[1]))
+        
         state    = self._states["WRONG_DIRECTION"][track.id]
 
         if f.direction_vec == (0.0, 0.0) or f.speed_kmh < 5.0:
@@ -493,16 +544,16 @@ class BehaviorEngine:
         """
         FLAG if a two-wheeler or three-wheeler is inside a restricted zone polygon.
         Zone polygon is configurable per camera.
-        One-shot per entry (resets when vehicle leaves zone).
         """
-        cfg   = self._cfg.get("highway_restriction", {})
+        cfg     = self._cfg.get("highway_restriction", {})
         
         if not cfg.get("enabled", True):
             return None
 
-        zone  = cfg.get("zone_polygon",
-                        [[0,0],[1280,0],[1280,720],[0,720]])
-        state = self._states["HIGHWAY_RESTRICTION"][track.id]
+        zone_raw = cfg.get("zone_polygon", [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+        zone     = self._scale_roi(zone_raw)
+        sustain  = cfg.get("sustained_sec", 0.5)
+        state    = self._states["HIGHWAY_RESTRICTION"][track.id]
 
         if self._detector is None:
             return None
@@ -513,8 +564,8 @@ class BehaviorEngine:
 
         cx, cy = track.centroid
         if poly_contains_point(zone, (cx, cy)):
-            if not state.flagged:
-                state.flagged = True
+            state.begin(now)
+            if state.should_flag(now, sustain):
                 return Violation(
                     type="HIGHWAY_RESTRICTION", track_id=track.id,
                     vehicle_class=track.class_name, frame_idx=frame_idx,
@@ -522,7 +573,7 @@ class BehaviorEngine:
                     metadata={"zone": zone, "class": track.class_name},
                 )
         else:
-            state.flagged = False
+            state.reset()
         return None
 
     # ══════════════════════════════════════════════════════════════════
@@ -550,9 +601,9 @@ class BehaviorEngine:
             state.reset()
             return None
 
-        # Use lane_index as proxy — index 0=leftmost, higher = faster
-        # Flag if the vehicle is in lane ≥ 1 (not left lane)
-        if f.lane_index >= 1:
+        # Flag if the vehicle is on the right side (fast lane fraction)
+        cx, _ = track.centroid
+        if (cx / self._frame_w) >= fast_x:
             state.begin(now)
             if state.should_flag(now, sustain):
                 return Violation(
@@ -560,8 +611,8 @@ class BehaviorEngine:
                     vehicle_class=track.class_name, frame_idx=frame_idx,
                     confidence=0.85,
                     metadata={
-                        "lane_index": f.lane_index,
-                        "speed_kmh":  round(f.speed_kmh, 1),
+                        "lane_fraction": round(cx / self._frame_w, 2),
+                        "speed_kmh":     round(f.speed_kmh, 1),
                     },
                 )
         else:
@@ -672,10 +723,11 @@ class BehaviorEngine:
         """
         Only runs on cars.
         Crops driver region (upper-left quadrant of bbox).
-        Single frame threshold: confidence >= 0.85.
+        Requires sustained detection over time to avoid single-frame hallucination.
         """
         cfg      = self._cfg.get("seatbelt", {})
         conf_thr = cfg.get("confidence_threshold", 0.85)
+        sustain  = cfg.get("sustained_sec", 0.5)
         state    = self._states["NO_SEATBELT"][track.id]
 
         if self._detector is None or track.class_id not in {2}:  # car only
@@ -691,8 +743,8 @@ class BehaviorEngine:
         has_belt, conf = self._detector.classify_seatbelt(driver_crop)
 
         if not has_belt and conf >= 0.50:
-            if not state.flagged:
-                state.flagged = True
+            state.begin(now)
+            if state.should_flag(now, sustain):
                 return Violation(
                     type="NO_SEATBELT", track_id=track.id,
                     vehicle_class=track.class_name, frame_idx=frame_idx,
@@ -703,7 +755,7 @@ class BehaviorEngine:
                     },
                 )
         else:
-            state.flagged = False
+            state.reset()
         return None
 
     # ══════════════════════════════════════════════════════════════════
@@ -724,6 +776,7 @@ class BehaviorEngine:
         """
         cfg      = self._cfg.get("triple_riding", {})
         min_p    = cfg.get("min_persons", 3)
+        sustain  = cfg.get("sustained_duration_sec", 0.5)  # Require 0.5s of continuous detection
         state    = self._states["TRIPLE_RIDING"][track.id]
 
         if self._detector is None or not self._detector.is_two_wheeler(track.class_id):
@@ -731,8 +784,8 @@ class BehaviorEngine:
 
         inside = self._detector.persons_inside_bbox(persons, track.bbox)
         if len(inside) >= min_p:
-            if not state.flagged:
-                state.flagged = True
+            state.begin(now)
+            if state.should_flag(now, sustain):
                 return Violation(
                     type="TRIPLE_RIDING", track_id=track.id,
                     vehicle_class=track.class_name, frame_idx=frame_idx,
@@ -740,7 +793,7 @@ class BehaviorEngine:
                     metadata={"person_count": len(inside)},
                 )
         else:
-            state.flagged = False
+            state.reset()
         return None
 
     # ══════════════════════════════════════════════════════════════════
@@ -757,16 +810,18 @@ class BehaviorEngine:
         """
         FLAG if vehicle is in junction ROI AND direction vector rotates
         > angle_threshold_deg within time_window_sec.
-        Uses direction vector history (requires ≥ 2 valid steps).
+        Uses direction vector history. Requires sustained turn to avoid bbox jitter.
         """
         cfg       = self._cfg.get("illegal_turn", {})
-        roi       = cfg.get("junction_roi", [[300,400],[900,400],[900,720],[300,720]])
+        roi_raw   = cfg.get("junction_roi", [[0.23, 0.55], [0.70, 0.55], [0.70, 1.0], [0.23, 1.0]])
+        roi       = self._scale_roi(roi_raw)
         angle_thr = cfg.get("angle_threshold_deg", 135.0)
+        sustain   = cfg.get("sustained_sec", 0.5)
         state     = self._states["ILLEGAL_TURN"][track.id]
 
         cx, cy = track.centroid
         if not poly_contains_point(roi, (cx, cy)):
-            state.flagged = False
+            state.reset()
             return None
 
         if f.direction_vec == (0.0, 0.0):
@@ -779,17 +834,20 @@ class BehaviorEngine:
         if prev_dir is not None and prev_dir != (0.0, 0.0):
             dot = max(-1.0, min(1.0, vector_dot(prev_dir, curr_dir)))
             angle = math.degrees(math.acos(dot))
-            if angle > angle_thr and not state.flagged:
-                state.flagged = True
-                state._prev_dir = curr_dir
-                return Violation(
-                    type="ILLEGAL_TURN", track_id=track.id,
-                    vehicle_class=track.class_name, frame_idx=frame_idx,
-                    confidence=0.80,
-                    metadata={"angle_deg": round(angle, 1)},
-                )
+            if angle > angle_thr:
+                state.begin(now)
+                if state.should_flag(now, sustain):
+                    state._prev_dir = curr_dir
+                    return Violation(
+                        type="ILLEGAL_TURN", track_id=track.id,
+                        vehicle_class=track.class_name, frame_idx=frame_idx,
+                        confidence=0.80,
+                        metadata={"angle_deg": round(angle, 1)},
+                    )
+            else:
+                state.reset()
         else:
-            state.flagged = False
+            state.reset()
 
         state._prev_dir = curr_dir
         return None
@@ -812,6 +870,7 @@ class BehaviorEngine:
         """
         cfg      = self._cfg.get("phone_use", {})
         conf_thr = cfg.get("confidence_threshold", 0.80)
+        sustain  = cfg.get("sustained_sec", 0.5)
         state    = self._states["PHONE_USE"][track.id]
 
         if track.class_id not in {2}:  # car only
@@ -823,8 +882,8 @@ class BehaviorEngine:
         using_phone, conf = self._detector.classify_phone(driver_crop)
 
         if using_phone and conf >= conf_thr:
-            if not state.flagged:
-                state.flagged = True
+            state.begin(now)
+            if state.should_flag(now, sustain):
                 return Violation(
                     type="PHONE_USE", track_id=track.id,
                     vehicle_class=track.class_name, frame_idx=frame_idx,
@@ -832,5 +891,5 @@ class BehaviorEngine:
                     metadata={"confidence": conf},
                 )
         else:
-            state.flagged = False
+            state.reset()
         return None

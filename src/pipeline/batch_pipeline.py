@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import cv2
 from tqdm import tqdm
 
 from src.anpr.anpr import ANPRSystem
@@ -105,20 +106,33 @@ class BatchPipeline:
 
             frame_count = 0
             viol_count  = 0
+            emitted_violations = set()
 
             for packet in source.stream():
                 frame     = packet.frame
                 frame_idx = packet.frame_idx
                 frame_ts  = packet.timestamp
 
-                process_every_n = self._cfg.get("camera", {}).get("process_every_n_frames", 3)
+                # Batch uses a separate (higher) frame skip for speed
+                process_every_n = self._cfg.get("camera", {}).get("batch_process_every_n_frames", 5)
                 if frame_idx % process_every_n != 0:
                     frame_count += 1
                     pbar.update(1)
                     continue
 
+                # ── Resize for speed (batch only) ─────────────────────
+                # Scale based on the longest edge to handle portrait gracefully
+                resize_max = self._cfg.get("camera", {}).get("batch_resize_width", 960)
+                h, w = frame.shape[:2]
+                if resize_max and resize_max > 0 and max(h, w) > resize_max:
+                    scale = resize_max / max(h, w)
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
                 # ── DIP + LLIE ────────────────────────────────────────
-                frame = self._dip.preprocess(frame)
+                frame, _dip_report = self._dip.preprocess(frame, frame_idx=frame_idx)
                 frame = self._llie.enhance_if_dark(frame)
 
                 # ── Lane ──────────────────────────────────────────────
@@ -155,6 +169,7 @@ class BatchPipeline:
                     frame_idx=frame_idx,
                     frame=frame,
                     persons=persons,
+                    frame_ts=frame_ts,
                 )
 
                 # ── Per-violation processing ──────────────────────────
@@ -164,6 +179,12 @@ class BatchPipeline:
                     )
                     if track is None:
                         continue
+
+                    # Deduplication: 1 violation type per track per video
+                    dedup_key = (track.id, violation.type)
+                    if dedup_key in emitted_violations:
+                        continue
+                    emitted_violations.add(dedup_key)
 
                     # ANPR
                     plate = self._anpr.recognize(frame, vehicle_bbox=track.bbox)
@@ -213,6 +234,7 @@ class BatchPipeline:
                         metadata_dict=violation.metadata,
                         secret_key=self._secret_key,
                         ocr_status=ocr_status,
+                        dedup_window_sec=self._cfg.get("system", {}).get("dedup_window_sec", 120),
                     )
 
                     log_violation(

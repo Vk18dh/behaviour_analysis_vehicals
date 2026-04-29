@@ -33,7 +33,7 @@ from src.utils.helpers import load_config
 
 _CFG      = load_config()
 _API_BASE = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000")
-_TIMEOUT  = 10.0
+_TIMEOUT  = 30.0
 
 
 def _api(method: str, path: str, **kwargs):
@@ -111,7 +111,9 @@ def _sidebar_settings():
     st.sidebar.header("⚙️ Settings")
     
     if "hw_restrict_enabled" not in st.session_state:
-        st.session_state["hw_restrict_enabled"] = True
+        # Fetch actual state from API instead of defaulting to True
+        res = _api("GET", "/config/highway_restriction")
+        st.session_state["hw_restrict_enabled"] = res.get("highway_restriction_enabled", False) if res else False
         
     enabled = st.sidebar.toggle(
         "Highway Restriction Detection", 
@@ -132,7 +134,21 @@ def _sidebar_settings():
 # ══════════════════════════════════════════════════════════════════════
 
 def _violations_page(filters: dict):
-    st.header("📋 Violations — Human Review Queue")
+    col_h1, col_h2 = st.columns([3, 1])
+    with col_h1:
+        st.header("📋 Violations — Human Review Queue")
+    
+    with col_h2:
+        if st.session_state.get("role", "admin") == "admin":
+            with st.expander("🗑️ Danger Zone"):
+                st.warning("This will permanently delete all violations.")
+                if st.button("Clear All Violations", type="primary", use_container_width=True):
+                    res = _api("DELETE", "/violations")
+                    if res and res.get("status") == "ok":
+                        st.success(f"Cleared {res.get('deleted_count')} violations!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to clear database.")
 
     params = {k: v for k, v in filters.items() if v is not None}
     data   = _api("GET", "/violations", params=params)
@@ -176,7 +192,11 @@ def _violations_page(filters: dict):
             with col2:
                 img_path = v.get("evidence_image")
                 if img_path and Path(img_path).exists():
-                    st.image(img_path, caption="Evidence", use_container_width=True)
+                    try:
+                        with open(img_path, "rb") as im_f:
+                            st.image(im_f.read(), caption="Evidence")
+                    except Exception as e:
+                        st.error(f"Could not load image: {e}")
                 else:
                     st.caption("No image available")
 
@@ -316,28 +336,449 @@ def _status_page():
 def _upload_page():
     st.header("📤 Upload Traffic Video")
     st.write("Upload a pre-recorded `.mp4` or `.avi` traffic video to process it through the AI pipeline.")
-    
+
     uploaded_file = st.file_uploader("Choose a video file", type=["mp4", "avi", "mov"])
+
     if uploaded_file is not None:
-        if st.button("Start Processing"):
-            with st.spinner("Uploading and starting batch pipeline..."):
-                token = st.session_state.get("token")
-                headers = {"Authorization": f"Bearer {token}"} if token else {}
+        token   = st.session_state.get("token")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+        if st.button("🚀 Start Processing", type="primary"):
+            video_bytes = uploaded_file.getvalue()
+
+            # ── 1. Submit to full detection pipeline (background) ────
+            with st.spinner("Submitting to detection pipeline…"):
                 try:
-                    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "video/mp4")}
-                    resp = httpx.post(
+                    files = {"file": (uploaded_file.name, video_bytes, "video/mp4")}
+                    resp  = httpx.post(
                         f"{_API_BASE}/upload_video",
-                        headers=headers,
-                        files=files,
-                        timeout=30.0
+                        headers=headers, files=files, timeout=30.0,
                     )
                     if resp.status_code in (200, 202):
-                        st.success("✅ Video successfully uploaded! The AI pipeline is now processing it in the background.")
-                        st.info("Check the 'Violations Review' tab in a few moments to see the detected violations appear.")
+                        st.success(
+                            "✅ Video submitted! The AI detection pipeline is running in the background. "
+                            "Check **Violations Review** in a few moments."
+                        )
                     else:
-                        st.error(f"Failed to start processing: {resp.text}")
+                        st.error(f"Pipeline submission failed: {resp.text}")
                 except Exception as e:
                     st.error(f"Upload failed: {e}")
+
+            # ── 2. Run DIP analysis immediately and show inline ──────
+            st.divider()
+            st.subheader("🔬 DIP Processing Report for this Video")
+            with st.spinner("Analysing video quality frame-by-frame…"):
+                try:
+                    files2 = {"file": (uploaded_file.name, video_bytes, "video/mp4")}
+                    resp2  = httpx.post(
+                        f"{_API_BASE}/dip/analyze_video",
+                        headers=headers, files=files2,
+                        params={"max_frames": 30},
+                        timeout=120.0,
+                    )
+                    if resp2.status_code == 200:
+                        st.session_state["upload_dip_result"] = resp2.json()
+                    else:
+                        st.warning(f"DIP analysis failed: {resp2.text}")
+                except Exception as e:
+                    st.warning(f"DIP analysis error: {e}")
+
+        # ── Show DIP results if available ────────────────────────────
+        if "upload_dip_result" in st.session_state:
+            result  = st.session_state["upload_dip_result"]
+            reports = result.get("reports", [])
+
+            if not reports:
+                st.info("No DIP data available for this video.")
+            else:
+                total_sampled = result.get("total_frames_sampled", len(reports))
+                total_video   = result.get("total_frames_in_video", "?")
+                pc = result.get("problem_counts", {})
+                fc = result.get("fix_counts", {})
+
+                st.caption(
+                    f"Sampled **{total_sampled}** frames from {total_video} total frames"
+                )
+
+                # ── Problem metrics row ───────────────────────────────
+                if pc:
+                    cols = st.columns(min(len(pc), 4))
+                    for i, (prob, count) in enumerate(pc.items()):
+                        pct = round(count / max(total_sampled, 1) * 100, 1)
+                        emoji = {
+                            "LOW_LIGHT": "🌑", "OVEREXPOSED": "☀️",
+                            "BLUR": "🔲", "NOISE": "📡",
+                            "HAZE_FOG": "🌫", "COLOR_CAST": "🎨",
+                        }.get(prob, "⚠️")
+                        cols[i % 4].metric(
+                            f"{emoji} {prob.replace('_', ' ')}",
+                            f"{count} frames", f"{pct}% of video"
+                        )
+                else:
+                    st.success("✅ No quality problems detected in this video.")
+
+                # ── Charts side by side ───────────────────────────────
+                left, right = st.columns(2)
+
+                if pc:
+                    with left:
+                        prob_df = pd.DataFrame(list(pc.items()), columns=["Problem", "Frames"])
+                        fig_p = px.bar(
+                            prob_df, x="Problem", y="Frames",
+                            title="Problems Detected", color="Problem",
+                            color_discrete_map={
+                                "LOW_LIGHT": "#3498db", "OVEREXPOSED": "#e67e22",
+                                "BLUR": "#9b59b6", "NOISE": "#e74c3c",
+                                "HAZE_FOG": "#95a5a6", "COLOR_CAST": "#f1c40f",
+                            },
+                        )
+                        fig_p.update_layout(showlegend=False, height=260, margin=dict(t=35, b=10))
+                        st.plotly_chart(fig_p, use_container_width=True)
+
+                if fc:
+                    with right:
+                        fix_df = pd.DataFrame(list(fc.items()), columns=["Fix", "Frames"])
+                        fig_f = px.bar(
+                            fix_df, x="Fix", y="Frames",
+                            title="Fixes Applied", color="Fix",
+                        )
+                        fig_f.update_layout(showlegend=False, height=260, margin=dict(t=35, b=10))
+                        st.plotly_chart(fig_f, use_container_width=True)
+
+                # ── Quality timeline ──────────────────────────────────
+                df = pd.DataFrame(reports)
+                fig_tl = go.Figure()
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["brightness_before"],
+                    name="Brightness (raw)", line=dict(color="#aed6f1", dash="dot"),
+                ))
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["brightness_after"],
+                    name="Brightness (processed)", line=dict(color="#2980b9"),
+                ))
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["blur_score_before"],
+                    name="Blur Score (raw)", line=dict(color="#f9ca8f", dash="dot"),
+                    yaxis="y2",
+                ))
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["blur_score_after"],
+                    name="Blur Score (processed)", line=dict(color="#e67e22"),
+                    yaxis="y2",
+                ))
+                fig_tl.update_layout(
+                    title="Quality Before → After DIP Processing",
+                    xaxis_title="Frame #",
+                    yaxis=dict(title="Brightness (0–255)", side="left"),
+                    yaxis2=dict(title="Blur Score", side="right", overlaying="y"),
+                    legend=dict(orientation="h", y=-0.25),
+                    height=320, margin=dict(t=40, b=10),
+                )
+                st.plotly_chart(fig_tl, use_container_width=True)
+
+                # ── Worst frame ───────────────────────────────────────
+                df["n_problems"] = df["problems_detected"].apply(len)
+                worst = reports[int(df["n_problems"].idxmax())]
+                if worst["problems_detected"]:
+                    st.info(
+                        f"🔍 **Worst frame #{worst['frame_idx']}** — "
+                        f"Problems: `{'  ·  '.join(worst['problems_detected'])}` → "
+                        f"Fixes: `{'  ·  '.join(worst['fixes_applied'])}`  |  "
+                        f"Brightness {worst['brightness_before']:.0f}→{worst['brightness_after']:.0f}  "
+                        f"Blur {worst['blur_score_before']:.0f}→{worst['blur_score_after']:.0f}"
+                    )
+
+                with st.expander("📋 Full Frame Report Table"):
+                    st.dataframe(
+                        df[["frame_idx", "problems_detected", "fixes_applied",
+                            "brightness_before", "brightness_after",
+                            "blur_score_before", "blur_score_after", "noise_level"]],
+                        use_container_width=True,
+                    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DIP Monitor Page
+# ══════════════════════════════════════════════════════════════════════
+
+def _dip_monitor_page():
+    st.header("🔬 DIP Monitor — Frame Processing Analysis")
+    st.write(
+        "See exactly what the Digital Image Processing pipeline detected and fixed "
+        "for every frame — both live streams and uploaded videos."
+    )
+
+    live_tab, upload_tab = st.tabs(["📡 Live Stream Monitor", "📁 Video Analysis"])
+
+    # ── Tab 1: Live stream DIP stats ─────────────────────────────────
+    with live_tab:
+        st.subheader("Live Stream DIP Report")
+        st.caption("Shows the last N DIP-processed frames from the active pipeline. Click Refresh to update.")
+
+        col_left, col_right = st.columns([3, 1])
+        n_frames    = col_left.slider("Frames to display", 20, 500, 100, step=10)
+        do_refresh  = col_right.button("🔄 Refresh", use_container_width=True)
+
+        placeholder = st.empty()
+
+        def _render_live_dip(container):
+            data = _api("GET", "/dip/stats", params={"n": n_frames})
+            if data is None or data.get("status") == "no_active_pipeline":
+                container.info("⏸ No active live pipeline. Start a live stream first via 'System Status' or the API.")
+                return
+            reports = data.get("reports", [])
+            if not reports:
+                container.info("No DIP reports yet — pipeline may just have started.")
+                return
+
+            import pandas as pd
+            df = pd.DataFrame(reports)
+
+            # ── Metric cards ──────────────────────────────────────────
+            last = reports[-1]
+            m1, m2, m3, m4 = container.columns(4)
+            m1.metric(
+                "💡 Brightness",
+                f"{last['brightness_after']:.0f}",
+                delta=f"{last['brightness_after'] - last['brightness_before']:.0f}",
+                delta_color="normal",
+            )
+            m2.metric(
+                "🔲 Contrast",
+                f"{last['contrast_after']:.0f}",
+                delta=f"{last['contrast_after'] - last['contrast_before']:.0f}",
+            )
+            m3.metric(
+                "📐 Blur Score",
+                f"{last['blur_score_after']:.0f}",
+                delta=f"{last['blur_score_after'] - last['blur_score_before']:.0f}",
+            )
+            m4.metric("🌫 Noise Level", f"{last['noise_level']:.1f}")
+
+            # ── Problems detected (last frame) ────────────────────────
+            probs = last.get("problems_detected", [])
+            fixes = last.get("fixes_applied", [])
+            if probs:
+                container.warning(f"**Last frame problems:** {' · '.join(probs)}")
+                container.success(f"**Fixes applied:** {' · '.join(fixes)}")
+            else:
+                container.success("✅ Last frame: No problems detected — no fixes needed.")
+
+            # ── Problem frequency bar chart ───────────────────────────
+            all_probs = [p for r in reports for p in r.get("problems_detected", [])]
+            if all_probs:
+                prob_counts = pd.Series(all_probs).value_counts().reset_index()
+                prob_counts.columns = ["Problem", "Count"]
+                fig_prob = px.bar(
+                    prob_counts, x="Problem", y="Count",
+                    title=f"Problem Frequency (last {len(reports)} frames)",
+                    color="Problem",
+                    color_discrete_map={
+                        "LOW_LIGHT":   "#3498db",
+                        "OVEREXPOSED": "#e67e22",
+                        "BLUR":        "#9b59b6",
+                        "NOISE":       "#e74c3c",
+                        "HAZE_FOG":    "#95a5a6",
+                        "COLOR_CAST":  "#f1c40f",
+                    },
+                )
+                fig_prob.update_layout(showlegend=False, height=280)
+                container.plotly_chart(fig_prob, use_container_width=True)
+
+            # ── Fix frequency bar chart ───────────────────────────────
+            all_fixes = [f for r in reports for f in r.get("fixes_applied", [])]
+            if all_fixes:
+                fix_counts = pd.Series(all_fixes).value_counts().reset_index()
+                fix_counts.columns = ["Fix", "Count"]
+                fig_fix = px.bar(
+                    fix_counts, x="Fix", y="Count",
+                    title="Fixes Applied Frequency",
+                    color="Fix",
+                )
+                fig_fix.update_layout(showlegend=False, height=260)
+                container.plotly_chart(fig_fix, use_container_width=True)
+
+            # ── Quality timeline ──────────────────────────────────────
+            if len(df) > 1:
+                fig_tl = go.Figure()
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["brightness_before"],
+                    name="Brightness (raw)", line=dict(color="#aed6f1", dash="dot"),
+                ))
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["brightness_after"],
+                    name="Brightness (processed)", line=dict(color="#2980b9"),
+                ))
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["blur_score_before"],
+                    name="Blur Score (raw)", line=dict(color="#f9ca8f", dash="dot"),
+                    yaxis="y2",
+                ))
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["blur_score_after"],
+                    name="Blur Score (processed)", line=dict(color="#e67e22"),
+                    yaxis="y2",
+                ))
+                fig_tl.update_layout(
+                    title="Frame Quality Timeline",
+                    xaxis_title="Frame #",
+                    yaxis=dict(title="Brightness (0–255)", side="left"),
+                    yaxis2=dict(title="Blur Score (Laplacian var)", side="right", overlaying="y"),
+                    legend=dict(orientation="h", y=-0.2),
+                    height=350,
+                )
+                container.plotly_chart(fig_tl, use_container_width=True)
+
+            # ── Raw reports table ─────────────────────────────────────
+            with container.expander("📋 Raw Frame Reports Table"):
+                display_df = df[["frame_idx", "problems_detected", "fixes_applied",
+                                  "brightness_before", "brightness_after",
+                                  "blur_score_before", "blur_score_after",
+                                  "noise_level"]].tail(50)
+                st.dataframe(display_df, use_container_width=True)
+
+        _render_live_dip(placeholder)
+
+    # ── Tab 2: Uploaded video DIP analysis ───────────────────────────
+    with upload_tab:
+        st.subheader("Upload Video for DIP Analysis")
+        st.write(
+            "Upload any traffic video. The system will run **only** the DIP analysis "
+            "(no full detection) and show you which frames had problems and what was fixed."
+        )
+
+        up_file   = st.file_uploader("Choose video", type=["mp4", "avi", "mov"], key="dip_upload")
+        max_frames = st.slider("Frames to sample (more = slower)", 10, 100, 30, step=10)
+
+        if up_file and st.button("🔬 Analyse DIP Processing"):
+            with st.spinner("Running frame-by-frame DIP analysis…"):
+                token   = st.session_state.get("token")
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                try:
+                    resp = httpx.post(
+                        f"{_API_BASE}/dip/analyze_video",
+                        headers=headers,
+                        files={"file": (up_file.name, up_file.getvalue(), "video/mp4")},
+                        params={"max_frames": max_frames},
+                        timeout=120.0,
+                    )
+                    if resp.status_code == 200:
+                        result = resp.json()
+                        st.session_state["dip_analysis"] = result
+                    else:
+                        st.error(f"Analysis failed: {resp.text}")
+                except Exception as e:
+                    st.error(f"Request error: {e}")
+
+        if "dip_analysis" in st.session_state:
+            result = st.session_state["dip_analysis"]
+            reports = result.get("reports", [])
+            if not reports:
+                st.warning("No frames analysed.")
+            else:
+                import pandas as pd
+
+                df = pd.DataFrame(reports)
+                total_sampled = result.get("total_frames_sampled", len(reports))
+                total_video   = result.get("total_frames_in_video", "?")
+
+                st.success(
+                    f"✅ Analysed **{total_sampled}** sampled frames "
+                    f"from {total_video} total frames."
+                )
+
+                # ── Summary metrics ───────────────────────────────────
+                pc = result.get("problem_counts", {})
+                fc = result.get("fix_counts", {})
+
+                if pc:
+                    st.subheader("📊 Problem Summary")
+                    mc = st.columns(min(len(pc), 4))
+                    for i, (prob, count) in enumerate(pc.items()):
+                        pct = round(count / total_sampled * 100, 1)
+                        mc[i % 4].metric(prob.replace("_", " "), f"{count} frames", f"{pct}% of video")
+
+                # ── Problem frequency bar ─────────────────────────────
+                if pc:
+                    prob_df = pd.DataFrame(list(pc.items()), columns=["Problem", "Frames"])
+                    fig_p = px.bar(
+                        prob_df, x="Problem", y="Frames",
+                        title="Frames Affected by Each Problem",
+                        color="Problem",
+                    )
+                    fig_p.update_layout(showlegend=False, height=280)
+                    st.plotly_chart(fig_p, use_container_width=True)
+
+                # ── Fix frequency ─────────────────────────────────────
+                if fc:
+                    fix_df = pd.DataFrame(list(fc.items()), columns=["Fix Applied", "Frames"])
+                    fig_f = px.bar(
+                        fix_df, x="Fix Applied", y="Frames",
+                        title="Fixes Applied (how many frames each fix was used)",
+                        color="Fix Applied",
+                    )
+                    fig_f.update_layout(showlegend=False, height=280)
+                    st.plotly_chart(fig_f, use_container_width=True)
+
+                # ── Quality improvement timeline ──────────────────────
+                st.subheader("📈 Quality Before vs After — Full Video")
+                fig_tl = go.Figure()
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["brightness_before"],
+                    name="Brightness (raw)", line=dict(color="#aed6f1", dash="dot"),
+                ))
+                fig_tl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["brightness_after"],
+                    name="Brightness (processed)", line=dict(color="#2980b9"),
+                ))
+                fig_tl.update_layout(
+                    xaxis_title="Frame #", yaxis_title="Brightness",
+                    height=300, legend=dict(orientation="h"),
+                )
+                st.plotly_chart(fig_tl, use_container_width=True)
+
+                fig_bl = go.Figure()
+                fig_bl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["blur_score_before"],
+                    name="Blur Score (raw)", line=dict(color="#f9ca8f", dash="dot"),
+                ))
+                fig_bl.add_trace(go.Scatter(
+                    x=df["frame_idx"], y=df["blur_score_after"],
+                    name="Blur Score (processed)", line=dict(color="#e67e22"),
+                ))
+                fig_bl.update_layout(
+                    xaxis_title="Frame #", yaxis_title="Blur Score (Laplacian var)",
+                    height=280, legend=dict(orientation="h"),
+                )
+                st.plotly_chart(fig_bl, use_container_width=True)
+
+                # ── Worst frame highlight ─────────────────────────────
+                st.subheader("🔍 Worst Quality Frame")
+                # Find frame with most problems
+                df["n_problems"] = df["problems_detected"].apply(len)
+                worst_idx = int(df["n_problems"].idxmax())
+                worst     = reports[worst_idx]
+                st.info(
+                    f"**Frame #{worst['frame_idx']}** had the most issues: "
+                    f"`{'  ·  '.join(worst['problems_detected']) or 'None'}`  →  "
+                    f"Fixes: `{'  ·  '.join(worst['fixes_applied']) or 'None'}`"
+                )
+                wcol1, wcol2, wcol3 = st.columns(3)
+                wcol1.metric("Brightness before / after",
+                             f"{worst['brightness_before']:.0f}",
+                             delta=f"→ {worst['brightness_after']:.0f}")
+                wcol2.metric("Blur score before / after",
+                             f"{worst['blur_score_before']:.0f}",
+                             delta=f"→ {worst['blur_score_after']:.0f}")
+                wcol3.metric("Noise Level", f"{worst['noise_level']:.1f}")
+
+                # ── Raw table ─────────────────────────────────────────
+                with st.expander("📋 Full Frame Report Table"):
+                    show_df = df[["frame_idx", "problems_detected", "fixes_applied",
+                                   "brightness_before", "brightness_after",
+                                   "blur_score_before", "blur_score_after",
+                                   "noise_level"]]
+                    st.dataframe(show_df, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -365,7 +806,8 @@ def main():
     # Navigation
     page = st.sidebar.radio(
         "Navigation",
-        ["🔍 Violations Review", "📊 Credit Scores", "🖥️ System Status", "📤 Upload Video"],
+        ["🔍 Violations Review", "📊 Credit Scores", "🖥️ System Status",
+         "📤 Upload Video", "🔬 DIP Monitor"],
     )
 
     filters = _sidebar_filters()
@@ -379,6 +821,8 @@ def main():
         _status_page()
     elif page == "📤 Upload Video":
         _upload_page()
+    elif page == "🔬 DIP Monitor":
+        _dip_monitor_page()
 
 
 if __name__ == "__main__":

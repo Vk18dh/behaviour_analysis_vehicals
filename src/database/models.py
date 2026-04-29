@@ -58,7 +58,7 @@ class Violation(Base):
 
     id                 = Column(Integer, primary_key=True, autoincrement=True)
     vehicle_id         = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
-    type               = Column(String(64),  nullable=False)   # e.g. "ZIGZAG"
+    type               = Column(String(64),  nullable=False, index=True)   # e.g. "ZIGZAG" — indexed for dashboard filters
     timestamp          = Column(DateTime,    default=datetime.utcnow, index=True)
     speed_kmh          = Column(Float,       nullable=True)
     fine_inr           = Column(Float,       nullable=True)
@@ -67,11 +67,11 @@ class Violation(Base):
     ocr_confidence     = Column(Float,       nullable=True)
     plate_text         = Column(String(64),  nullable=True)    # plain (not encrypted)
     mv_act_section     = Column(String(256), nullable=True)
-    camera_id          = Column(String(64),  nullable=True)
+    camera_id          = Column(String(64),  nullable=True, index=True)
     gps_lat            = Column(Float,       nullable=True)
     gps_lon            = Column(Float,       nullable=True)
     metadata_json      = Column(Text,        nullable=True)    # JSON blob of extra info
-    # Human-review status
+    # Human-review status — indexed for pending/approved/rejected queue queries
     status             = Column(
         String(32), default="pending", index=True
     )  # pending | approved | rejected | low_confidence

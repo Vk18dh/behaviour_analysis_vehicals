@@ -29,7 +29,7 @@ from src.features.feature_extractor import FeatureExtractor
 from src.input.frame_buffer import FrameBuffer
 from src.input.video_input import VideoSource
 from src.lane.lane_detection import LaneDetector
-from src.preprocessing.dip import DIPPreprocessor
+from src.preprocessing.dip import DIPPreprocessor, register_dip_instance
 from src.preprocessing.llie import LLIEProcessor
 from src.rules.rule_engine import RuleEngine
 from src.tracking.tracker import VehicleTracker
@@ -65,6 +65,7 @@ class RealtimePipeline:
 
         # Instantiate all modules
         self._dip      = DIPPreprocessor(cfg.get("preprocessing", {}))
+        register_dip_instance(self._dip)   # expose to /dip/stats API endpoint
         self._llie     = LLIEProcessor(
             cfg.get("llie", {}),
             dark_threshold=cfg.get("preprocessing", {}).get("dark_frame_threshold", 80),
@@ -132,6 +133,10 @@ class RealtimePipeline:
         logger.info(f"[{camera_id}] Pipeline running at target {self._target_fps} FPS.")
         frame_count   = 0
         latency_total = 0.0
+        
+        # Track-based deduplication for the live stream:
+        # dict mapping track_id -> set of emitted violation types.
+        emitted_violations = {}
 
         try:
             while not self._stop_event.is_set():
@@ -156,7 +161,7 @@ class RealtimePipeline:
                     continue
 
                 # ── 2. DIP Preprocessing ──────────────────────────────
-                frame = self._dip.preprocess(frame)
+                frame, _dip_report = self._dip.preprocess(frame, frame_idx=frame_idx)
 
                 # ── 3. LLIE (if dark) ─────────────────────────────────
                 frame = self._llie.enhance_if_dark(frame)
@@ -195,13 +200,26 @@ class RealtimePipeline:
                     frame_idx=frame_idx,
                     frame=frame,
                     persons=persons,
+                    frame_ts=frame_ts,
                 )
+
+                # Prune deduplication cache for vehicles that have left the frame
+                active_track_ids = {t.id for t in tracks}
+                for tid in list(emitted_violations.keys()):
+                    if tid not in active_track_ids:
+                        del emitted_violations[tid]
 
                 # ── 9. Per-violation: ANPR + Evidence + DB ────────────
                 for violation in violations:
                     track = next((t for t in tracks if t.id == violation.track_id), None)
                     if track is None:
                         continue
+                        
+                    # Deduplication: 1 violation type per track per crossing
+                    if violation.type in emitted_violations.get(track.id, set()):
+                        continue
+                    emitted_violations.setdefault(track.id, set()).add(violation.type)
+
                     f = feat_map.get(violation.track_id)
 
                     # ANPR
@@ -257,6 +275,7 @@ class RealtimePipeline:
                         metadata_dict=violation.metadata,
                         secret_key=self._secret_key,
                         ocr_status=ocr_status,
+                        dedup_window_sec=self._cfg.get("system", {}).get("dedup_window_sec", 120),
                     )
 
                     # Violation log

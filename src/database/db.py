@@ -14,7 +14,7 @@ import hashlib
 import json
 import os
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Generator, Optional
 
 from sqlalchemy import create_engine, text
@@ -38,12 +38,24 @@ def _build_engine(db_url: str):
     connect_args = {}
     if db_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
+    
     engine = create_engine(
         db_url,
         connect_args=connect_args,
         pool_pre_ping=True,
         echo=False,
     )
+
+    if db_url.startswith("sqlite"):
+        from sqlalchemy import event
+        @event.listens_for(engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.close()
+
     return engine
 
 
@@ -69,7 +81,52 @@ def init_db(db_url: Optional[str] = None) -> None:
     Base.metadata.create_all(_ENGINE)
     logger.info(f"Database initialised: {url}")
 
+    _check_security_config()
     _seed_admin()
+
+
+_DEFAULT_SECRETS = {
+    "CHANGE_ME_IN_PRODUCTION_32CHARS!!",
+    "CHANGEME_32bytes_key!!",
+    "CHANGE_ME_JWT_SECRET_KEY",
+    "",
+}
+
+
+def _check_security_config() -> None:
+    """
+    Warn loudly if any placeholder secrets are still active.
+    Reads from environment variables so values can be overridden without
+    editing the config file (recommended for production).
+    """
+    import yaml
+    cfg_path = os.path.join(os.path.dirname(__file__), "..", "..", "config", "settings.yaml")
+    try:
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+    except Exception:
+        cfg = {}
+
+    aes_key  = os.environ.get("AES_SECRET_KEY",  cfg.get("system",   {}).get("secret_key", ""))
+    jwt_key  = os.environ.get("JWT_SECRET_KEY",  cfg.get("security", {}).get("jwt_secret",  ""))
+    adm_pass = os.environ.get("ADMIN_PASS",      cfg.get("security", {}).get("default_admin_password", ""))
+
+    if aes_key in _DEFAULT_SECRETS:
+        logger.critical(
+            "SECURITY: system.secret_key is still the default placeholder! "
+            "Plate encryption is WEAK. Set AES_SECRET_KEY environment variable "
+            "or change secret_key in config/settings.yaml before production use."
+        )
+    if jwt_key in _DEFAULT_SECRETS:
+        logger.critical(
+            "SECURITY: security.jwt_secret is the default placeholder! "
+            "API tokens can be forged. Set JWT_SECRET_KEY env var."
+        )
+    if adm_pass in {"admin123", "CHANGE_ME", "admin", ""}:
+        logger.warning(
+            "SECURITY: Default admin password 'admin123' is active. "
+            "Change via ADMIN_PASS environment variable or settings.yaml."
+        )
 
 
 def _seed_admin() -> None:
@@ -332,16 +389,23 @@ def save_violation(
     metadata_dict:  dict,
     secret_key:     str,
     ocr_status:     str = "pending",
+    dedup_window_sec: int = 120,
 ) -> Optional[int]:
     """
     Persist a complete violation record including vehicle, score, and blockchain entry.
 
+    Deduplication: if the same plate already has a violation of the same type
+    saved within `dedup_window_sec` seconds, the new record is silently skipped
+    and None is returned.  This prevents a vehicle getting multiple fines for
+    the same continuous event (e.g. sustained over-speed across several frames).
+
     Args:
         All fields map 1:1 to Violation and related table columns.
-        secret_key: AES encryption key for plate numbers.
+        secret_key:       AES encryption key for plate numbers.
+        dedup_window_sec: Cooldown in seconds (default 120 = 2 minutes).
 
     Returns:
-        violation.id on success, None on failure.
+        violation.id on success, None on duplicate/failure.
     """
     try:
         with get_session() as db:
@@ -363,6 +427,29 @@ def save_violation(
             else:
                 vehicle.last_seen  = datetime.utcnow()
                 vehicle.class_name = vehicle_class
+
+            # ── Duplicate / Cooldown Guard ────────────────────────────
+            # Skip if the same plate got the same violation type recently.
+            # Handles: track-ID resets, frame-skip re-detection, batch re-runs.
+            if plate_text and dedup_window_sec > 0:
+                cutoff = datetime.utcnow() - timedelta(seconds=dedup_window_sec)
+                recent = (
+                    db.query(Violation)
+                    .filter(
+                        Violation.plate_text == plate_text,
+                        Violation.type       == violation_type,
+                        Violation.timestamp  >= cutoff,
+                    )
+                    .first()
+                )
+                if recent:
+                    logger.warning(
+                        f"[DEDUP] Skipped {violation_type} for plate '{plate_text}' — "
+                        f"duplicate of violation #{recent.id} "
+                        f"({int((datetime.utcnow() - recent.timestamp).total_seconds())}s ago). "
+                        f"Cooldown window: {dedup_window_sec}s."
+                    )
+                    return None
 
             # ── Insert Violation ──────────────────────────────────────
             viol = Violation(
